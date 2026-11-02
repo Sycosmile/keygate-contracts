@@ -2,10 +2,18 @@
 //!
 //! A throwaway `Recorder` contract stands in for the guarded target so the
 //! relayed call and its side effect are both observable.
+//!
+//! Mocked auths are still recorded, so the `*_requires_*` tests at the bottom
+//! assert on `env.auths()` to pin down which owner has to sign and for what.
+
+// The crate is `no_std`, but the test harness is not, and `env.auths()` hands
+// back a `std::vec::Vec`.
+extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, testutils::Address as _,
-    testutils::Ledger as _, Address, Env, IntoVal, String, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, symbol_short,
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 use super::{Error, KeygateMultisig, KeygateMultisigClient};
@@ -115,6 +123,38 @@ impl Fixture {
             &self.record_args(value),
         )
     }
+}
+
+/// Asserts the last invocation required exactly `expected` to sign, in the
+/// order the `require_auth` calls were made, and that each of them signed for
+/// `func` on `contract` with `args`.
+///
+/// Signature checks belong to the host, so `env.auths()` is the only way a unit
+/// test can see them. Asserting here is what turns a dropped `require_auth`
+/// into a failing test rather than a silent widening of who may call in.
+#[track_caller]
+fn assert_signed_by(
+    env: &Env,
+    contract: &Address,
+    func: Symbol,
+    args: Vec<Val>,
+    expected: &[&Address],
+) {
+    let mut want = std::vec::Vec::new();
+    for &address in expected {
+        want.push((
+            address.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract.clone(),
+                    func.clone(),
+                    args.clone(),
+                )),
+                sub_invocations: std::vec::Vec::new(),
+            },
+        ));
+    }
+    assert_eq!(env.auths(), want);
 }
 
 #[test]
@@ -448,4 +488,105 @@ fn proposal_ids_are_monotonic_across_owners() {
     assert_eq!(f.submit_record(&f.c, 3), 3);
     assert_eq!(f.client().live_ids().len(), 3);
     assert_eq!(f.client().proposal(&2).unwrap().proposed_at, 1_000);
+}
+
+// --- who has to sign -------------------------------------------------------
+//
+// One test per entry point that calls `require_auth`, each asserting the exact
+// authorisation the host recorded: address, contract function and arguments.
+// The state-transition tests above cannot catch a dropped `require_auth`.
+//
+// `initialize` is the exception: it has no `require_auth` at all. The contract
+// takes its owner set from deployment, so the first call is authorised by
+// whoever deploys it, not by a signature the contract could check.
+
+#[test]
+fn submit_requires_the_owner() {
+    let f = Fixture::new(2);
+
+    f.submit_record(&f.a, 42);
+
+    assert_signed_by(
+        &f.env,
+        &f.multisig,
+        Symbol::new(&f.env, "submit"),
+        (
+            f.a.clone(),
+            f.recorder.clone(),
+            Symbol::new(&f.env, "record"),
+            f.record_args(42),
+        )
+            .into_val(&f.env),
+        &[&f.a],
+    );
+}
+
+#[test]
+fn approve_requires_the_approving_owner() {
+    let f = Fixture::new(2);
+    let id = f.submit_record(&f.a, 42);
+
+    f.client().approve(&f.b, &id);
+
+    // The proposer already approved at submission; this signature is `b`'s own.
+    assert_signed_by(
+        &f.env,
+        &f.multisig,
+        Symbol::new(&f.env, "approve"),
+        (f.b.clone(), id).into_val(&f.env),
+        &[&f.b],
+    );
+}
+
+#[test]
+fn unapprove_requires_the_approving_owner() {
+    let f = Fixture::new(2);
+    let id = f.submit_record(&f.a, 42);
+    f.client().approve(&f.b, &id);
+
+    f.client().unapprove(&f.b, &id);
+
+    // Withdrawing consent must be the approver's own signature: an owner must
+    // not be able to un-approve on someone else's behalf.
+    assert_signed_by(
+        &f.env,
+        &f.multisig,
+        Symbol::new(&f.env, "unapprove"),
+        (f.b.clone(), id).into_val(&f.env),
+        &[&f.b],
+    );
+}
+
+#[test]
+fn cancel_requires_the_owner() {
+    let f = Fixture::new(2);
+    let id = f.submit_record(&f.a, 42);
+
+    f.client().cancel(&f.b, &id);
+
+    assert_signed_by(
+        &f.env,
+        &f.multisig,
+        Symbol::new(&f.env, "cancel"),
+        (f.b.clone(), id).into_val(&f.env),
+        &[&f.b],
+    );
+}
+
+#[test]
+fn execute_requires_the_owner() {
+    let f = Fixture::new(1);
+    let id = f.submit_record(&f.a, 42);
+
+    f.client().execute(&f.b, &id);
+
+    // The relayed call is authorised by the multisig's address, not by `b`, so
+    // the only signature recorded at this level is the executing owner's.
+    assert_signed_by(
+        &f.env,
+        &f.multisig,
+        Symbol::new(&f.env, "execute"),
+        (f.b.clone(), id).into_val(&f.env),
+        &[&f.b],
+    );
 }

@@ -1,6 +1,16 @@
 //! Unit tests for keygate-circuit-breaker. Run with `cargo test -p keygate-circuit-breaker`.
+//!
+//! Mocked auths are still recorded, so the `*_requires_*` tests at the bottom
+//! assert on `env.auths()` to pin down who has to sign and for what.
 
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, String};
+// The crate is `no_std`, but the test harness is not, and `env.auths()` hands
+// back a `std::vec::Vec`.
+extern crate std;
+
+use soroban_sdk::{
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 use super::{Error, KeygateBreaker, KeygateBreakerClient, Outcome};
 
@@ -44,6 +54,38 @@ impl Fixture {
         let now = self.env.ledger().timestamp();
         self.env.ledger().set_timestamp(now + seconds);
     }
+}
+
+/// Asserts the last invocation required exactly `expected` to sign, in the
+/// order the `require_auth` calls were made, and that each of them signed for
+/// `func` on `contract` with `args`.
+///
+/// Signature checks belong to the host, so `env.auths()` is the only way a unit
+/// test can see them. Asserting here is what turns a dropped `require_auth`
+/// into a failing test rather than a silent widening of who may call in.
+#[track_caller]
+fn assert_signed_by(
+    env: &Env,
+    contract: &Address,
+    func: Symbol,
+    args: Vec<Val>,
+    expected: &[&Address],
+) {
+    let mut want = std::vec::Vec::new();
+    for &address in expected {
+        want.push((
+            address.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract.clone(),
+                    func.clone(),
+                    args.clone(),
+                )),
+                sub_invocations: std::vec::Vec::new(),
+            },
+        ));
+    }
+    assert_eq!(env.auths(), want);
 }
 
 #[test]
@@ -247,4 +289,79 @@ fn initialize_rejects_a_second_call() {
         Err(Ok(Error::AlreadyInitialized))
     );
     assert_eq!(f.client().admin(), Some(f.admin.clone()));
+}
+
+// --- who has to sign -------------------------------------------------------
+//
+// One test per entry point that calls `require_auth`, each asserting the exact
+// authorisation the host recorded: address, contract function and arguments.
+// The state-transition tests above cannot catch a dropped `require_auth`.
+//
+// `enforce`, `remaining` and the views are deliberately unauthorised: the
+// breaker is a budget guard for callers the registry has already authenticated.
+
+#[test]
+fn initialize_requires_the_admin() {
+    let env = Env::default();
+    let contract = env.register(KeygateBreaker, ());
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    KeygateBreakerClient::new(&env, &contract).initialize(&admin);
+
+    assert_signed_by(
+        &env,
+        &contract,
+        Symbol::new(&env, "initialize"),
+        (admin.clone(),).into_val(&env),
+        &[&admin],
+    );
+}
+
+#[test]
+fn configure_requires_the_admin() {
+    let f = Fixture::new(1_000);
+
+    f.client().configure(&f.resource(), &2_000, &WINDOW);
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "configure"),
+        (f.resource(), 2_000_i128, WINDOW).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn trip_requires_the_admin() {
+    let f = Fixture::new(1_000);
+
+    f.client().trip(&f.resource());
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "trip"),
+        (f.resource(),).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn reset_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    f.client().trip(&f.resource());
+
+    f.client().reset(&f.resource());
+
+    // Re-opening a latched resource hands the budget back, so it is an admin
+    // action even when the latch came from an automatic breach.
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "reset"),
+        (f.resource(),).into_val(&f.env),
+        &[&f.admin],
+    );
 }

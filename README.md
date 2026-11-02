@@ -78,12 +78,12 @@ Admin operations on keygate contracts should be routed through `keygate-multisig
 
 ## Status and scope
 
-Version 0.1.0. All four crates are covered by unit tests — sixty-one of them, against the SDK's own `Env` — but **this code is unaudited** — read [SECURITY.md](./SECURITY.md) before holding real value with it. Deliberate limitations:
+Version 0.1.0. All four crates are covered by unit tests — eighty-five of them, against the SDK's own `Env` — but **this code is unaudited** — read [SECURITY.md](./SECURITY.md) before holding real value with it. Deliberate limitations:
 
 - Capability expiry is reclaimed lazily, on the first `check` of an expired grant. There is no background sweep, so a grant that is never queried stays in storage.
 - `keygate-policy` trusts the registry address it was configured with. Repointing it is an admin action and is emitted as an event for indexers.
 - A breaker breach is a **value** (`Outcome::Breached`), not an error, because a call that errors loses its writes and would lose the latch with them. That means a guarded call is stopped by the *caller* honouring the outcome; a caller that ignores it spends past its limit once, before the latch shuts everyone out. `enforce` has no way to close that gap on its own — see [SECURITY.md](./SECURITY.md).
-- Authorisation itself (`require_auth`) is enforced by the Soroban host. Unit tests mock all auths, so they cover state transitions, not signature validity.
+- Authorisation itself (`require_auth`) is enforced by the Soroban host. Unit tests mock all auths, so the cryptography of a signature is the host's to prove, not ours. What the tests do pin down is the authority side: every entry point that calls `require_auth` has a test asserting, through `env.auths()`, which address had to sign and for which function and arguments.
 
 ## Documentation
 

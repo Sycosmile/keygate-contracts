@@ -2,8 +2,18 @@
 //!
 //! These tests deploy the real keygate-core registry so the cross-contract
 //! capability check is covered rather than mocked away.
+//!
+//! Mocked auths are still recorded, so the `*_requires_*` tests at the bottom
+//! assert on `env.auths()` to pin down who has to sign and for what.
 
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, String};
+// The crate is `no_std`, but the test harness is not, and `env.auths()` hands
+// back a `std::vec::Vec`.
+extern crate std;
+
+use soroban_sdk::{
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 use keygate_core::{KeygateCore, KeygateCoreClient};
 
@@ -72,6 +82,38 @@ impl Fixture {
         self.policy_client()
             .evaluate(&self.resource(), &self.action(), holder)
     }
+}
+
+/// Asserts the last invocation required exactly `expected` to sign, in the
+/// order the `require_auth` calls were made, and that each of them signed for
+/// `func` on `contract` with `args`.
+///
+/// Signature checks belong to the host, so `env.auths()` is the only way a unit
+/// test can see them. Asserting here is what turns a dropped `require_auth`
+/// into a failing test rather than a silent widening of who may call in.
+#[track_caller]
+fn assert_signed_by(
+    env: &Env,
+    contract: &Address,
+    func: Symbol,
+    args: Vec<Val>,
+    expected: &[&Address],
+) {
+    let mut want = std::vec::Vec::new();
+    for &address in expected {
+        want.push((
+            address.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract.clone(),
+                    func.clone(),
+                    args.clone(),
+                )),
+                sub_invocations: std::vec::Vec::new(),
+            },
+        ));
+    }
+    assert_eq!(env.auths(), want);
 }
 
 #[test]
@@ -246,4 +288,113 @@ fn admin_transfer_moves_control() {
         .policy_client()
         .set_rule(&f.resource(), &f.action(), &Effect::Allow);
     assert_eq!(rule.id, 1);
+}
+
+// --- who has to sign -------------------------------------------------------
+//
+// One test per entry point that calls `require_auth`, each asserting the exact
+// authorisation the host recorded: address, contract function and arguments.
+// The state-transition tests above cannot catch a dropped `require_auth`.
+
+#[test]
+fn initialize_requires_the_admin() {
+    let env = Env::default();
+    let registry = env.register(KeygateCore, ());
+    let policy = env.register(KeygatePolicy, ());
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    KeygatePolicyClient::new(&env, &policy).initialize(&admin, &registry);
+
+    assert_signed_by(
+        &env,
+        &policy,
+        Symbol::new(&env, "initialize"),
+        (admin.clone(), registry.clone()).into_val(&env),
+        &[&admin],
+    );
+}
+
+#[test]
+fn set_rule_requires_the_admin() {
+    let f = Fixture::new(1_000);
+
+    f.policy_client()
+        .set_rule(&f.resource(), &f.action(), &Effect::Allow);
+
+    assert_signed_by(
+        &f.env,
+        &f.policy,
+        Symbol::new(&f.env, "set_rule"),
+        (f.resource(), f.action(), Effect::Allow).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn remove_rule_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    f.policy_client()
+        .set_rule(&f.resource(), &f.action(), &Effect::Allow);
+
+    f.policy_client().remove_rule(&f.resource(), &f.action());
+
+    assert_signed_by(
+        &f.env,
+        &f.policy,
+        Symbol::new(&f.env, "remove_rule"),
+        (f.resource(), f.action()).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn set_default_effect_requires_the_admin() {
+    let f = Fixture::new(1_000);
+
+    f.policy_client().set_default_effect(&Effect::Allow);
+
+    // Opening the default is the broadest privilege change in this contract,
+    // so the signature on it matters more than most.
+    assert_signed_by(
+        &f.env,
+        &f.policy,
+        Symbol::new(&f.env, "set_default_effect"),
+        (Effect::Allow,).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn set_registry_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    let replacement = f.env.register(KeygateCore, ());
+
+    f.policy_client().set_registry(&replacement);
+
+    assert_signed_by(
+        &f.env,
+        &f.policy,
+        Symbol::new(&f.env, "set_registry"),
+        (replacement.clone(),).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn transfer_admin_requires_both_the_old_and_the_new_admin() {
+    let f = Fixture::new(1_000);
+    let successor = Address::generate(&f.env);
+
+    f.policy_client().transfer_admin(&successor);
+
+    // Both signatures are on the same call: the outgoing admin releases control
+    // and the incoming one accepts it, so neither key can move it alone.
+    assert_signed_by(
+        &f.env,
+        &f.policy,
+        Symbol::new(&f.env, "transfer_admin"),
+        (successor.clone(),).into_val(&f.env),
+        &[&f.admin, &successor],
+    );
 }

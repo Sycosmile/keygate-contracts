@@ -236,7 +236,11 @@ impl KeygateMultisig {
         if proposal.target == env.current_contract_address() {
             Self::run_on_self(&env, &proposal.func, &proposal.args)?;
         } else {
-            env.invoke_contract::<()>(&proposal.target, &proposal.func, proposal.args.clone());
+            // The return value is discarded rather than decoded as `()`: a
+            // proposal is about the call's effect, and keygate entry points
+            // return everything from `()` to a `Grant` or a `Rule`.
+            let _ =
+                env.invoke_contract::<Val>(&proposal.target, &proposal.func, proposal.args.clone());
         }
         let mut done = proposal.clone();
         done.executed = true;

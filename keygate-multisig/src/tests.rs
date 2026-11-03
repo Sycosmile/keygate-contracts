@@ -1,7 +1,10 @@
 //! Unit tests for keygate-multisig. Run with `cargo test -p keygate-multisig`.
 //!
 //! A throwaway `Recorder` contract stands in for the guarded target so the
-//! relayed call and its side effect are both observable.
+//! relayed call and its side effect are both observable. The tests at the
+//! bottom go one step further: they make the multisig the admin of a real
+//! `keygate-core` registry, so the documented setup (route admin actions
+//! through the multisig, never a single key) is covered end to end.
 //!
 //! Mocked auths are still recorded, so the `*_requires_*` tests at the bottom
 //! assert on `env.auths()` to pin down which owner has to sign and for what.
@@ -15,6 +18,8 @@ use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _},
     Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
+
+use keygate_core::{KeygateCore, KeygateCoreClient};
 
 use super::{Error, KeygateMultisig, KeygateMultisigClient};
 
@@ -478,6 +483,130 @@ fn a_self_proposal_must_ask_for_something_the_multisig_can_apply() {
         f.client().try_execute(&f.a, &bad),
         Err(Ok(Error::MalformedSelfCall))
     );
+}
+
+// --- relaying admin calls into a real registry -----------------------------
+//
+// The README's recommended deployment gives the multisig's contract address the
+// admin role and keeps every owner's key out of it. These tests deploy the real
+// `keygate-core` behind that arrangement, so `execute` is making an actual
+// cross-contract call and the registry's own `require_auth` decides whether it
+// lands. Nothing is stubbed: if the multisig were not the registry's admin, the
+// paused flag and the issued grant below would not change.
+
+/// A real registry administered by an n-of-3 multisig.
+struct AdminFixture {
+    env: Env,
+    multisig: Address,
+    core: Address,
+    a: Address,
+    b: Address,
+    c: Address,
+}
+
+impl AdminFixture {
+    fn new(threshold: u32) -> AdminFixture {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        // The multisig has to exist before the registry is initialised, because
+        // core records its admin at that point and never accepts a plain key.
+        let multisig = env.register(KeygateMultisig, ());
+        let core = env.register(KeygateCore, ());
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let mut owners = Vec::new(&env);
+        owners.push_back(a.clone());
+        owners.push_back(b.clone());
+        owners.push_back(c.clone());
+
+        env.mock_all_auths();
+        KeygateMultisigClient::new(&env, &multisig).initialize(&owners, &threshold);
+        KeygateCoreClient::new(&env, &core).initialize(&multisig);
+
+        AdminFixture {
+            env,
+            multisig,
+            core,
+            a,
+            b,
+            c,
+        }
+    }
+
+    fn client(&self) -> KeygateMultisigClient<'_> {
+        KeygateMultisigClient::new(&self.env, &self.multisig)
+    }
+
+    fn core_client(&self) -> KeygateCoreClient<'_> {
+        KeygateCoreClient::new(&self.env, &self.core)
+    }
+
+    /// A proposal against the registry, with pre-encoded arguments so each test
+    /// can reproduce exactly the call core exposes.
+    fn submit(&self, caller: &Address, func: Symbol, args: Vec<Val>) -> u64 {
+        self.client().submit(caller, &self.core, &func, &args)
+    }
+}
+
+#[test]
+fn pause_only_reaches_the_registry_at_quorum() {
+    let f = AdminFixture::new(2);
+    // No owner is the admin; the multisig's address is.
+    assert_eq!(f.core_client().admin(), Some(f.multisig.clone()));
+
+    let id = f.submit(&f.a, Symbol::new(&f.env, "pause"), Vec::new(&f.env));
+    assert!(!f.core_client().paused());
+
+    // The proposer alone is one short of the 2-of-3 threshold, so the relay must
+    // not run and the registry must stay open.
+    assert_eq!(
+        f.client().try_execute(&f.a, &id),
+        Err(Ok(Error::QuorumNotMet))
+    );
+    assert!(!f.core_client().paused());
+    assert_eq!(f.client().live_ids().len(), 1);
+    assert!(!f.client().proposal(&id).unwrap().executed);
+
+    // A second approval is quorum; the third owner can push the button.
+    f.client().approve(&f.b, &id);
+    f.client().execute(&f.c, &id);
+
+    assert!(f.core_client().paused());
+    assert!(f.client().proposal(&id).unwrap().executed);
+    // Executed work leaves the pending set, so an indexer's cursor drains.
+    assert_eq!(f.client().live_ids().len(), 0);
+}
+
+#[test]
+fn issue_through_a_quorum_proposal_creates_a_grant_that_checks() {
+    let f = AdminFixture::new(2);
+    let holder = Address::generate(&f.env);
+    let resource = String::from_str(&f.env, "vault:main");
+    let action = String::from_str(&f.env, "withdraw");
+
+    let mut args = Vec::new(&f.env);
+    args.push_back(resource.clone().into_val(&f.env));
+    args.push_back(action.clone().into_val(&f.env));
+    args.push_back(holder.clone().into_val(&f.env));
+    args.push_back(3_600u64.into_val(&f.env));
+
+    let id = f.submit(&f.a, Symbol::new(&f.env, "issue"), args);
+    // Below quorum the holder has nothing: the registry was never called.
+    assert!(!f.core_client().check(&resource, &action, &holder));
+    assert_eq!(
+        f.client().try_execute(&f.a, &id),
+        Err(Ok(Error::QuorumNotMet))
+    );
+    assert!(!f.core_client().check(&resource, &action, &holder));
+
+    f.client().approve(&f.b, &id);
+    f.client().execute(&f.a, &id);
+
+    // The grant is real registry state, so the capability check passes.
+    assert!(f.core_client().check(&resource, &action, &holder));
+    assert_eq!(f.core_client().live_ids().len(), 1);
+    assert_eq!(f.client().live_ids().len(), 0);
 }
 
 #[test]

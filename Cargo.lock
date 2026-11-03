@@ -902,6 +902,7 @@ dependencies = [
 name = "keygate-multisig"
 version = "0.1.0"
 dependencies = [
+ "keygate-core",
  "soroban-sdk",
 ]
 

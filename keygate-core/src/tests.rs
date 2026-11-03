@@ -2,8 +2,17 @@
 //!
 //! Authorisation itself is enforced by the Soroban host rather than by our own
 //! comparisons, so these tests mock all auths and focus on state transitions.
+//! Mocked auths are still *recorded*, so the `*_requires_*` tests at the bottom
+//! assert on `env.auths()` to pin down who has to sign and for what.
 
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, String};
+// The crate is `no_std`, but the test harness is not, and `env.auths()` hands
+// back a `std::vec::Vec`.
+extern crate std;
+
+use soroban_sdk::{
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, Val, Vec,
+};
 
 use super::{Error, Grant, KeygateCore, KeygateCoreClient};
 
@@ -61,6 +70,38 @@ impl Fixture {
         self.client()
             .issue(&self.resource(), &self.action(), &self.holder, &3_600)
     }
+}
+
+/// Asserts the last invocation required exactly `expected` to sign, in the
+/// order the `require_auth` calls were made, and that each of them signed for
+/// `func` on `contract` with `args`.
+///
+/// Signature checks belong to the host, so `env.auths()` is the only way a unit
+/// test can see them. Asserting here is what turns a dropped `require_auth`
+/// into a failing test rather than a silent widening of who may call in.
+#[track_caller]
+fn assert_signed_by(
+    env: &Env,
+    contract: &Address,
+    func: Symbol,
+    args: Vec<Val>,
+    expected: &[&Address],
+) {
+    let mut want = std::vec::Vec::new();
+    for &address in expected {
+        want.push((
+            address.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    contract.clone(),
+                    func.clone(),
+                    args.clone(),
+                )),
+                sub_invocations: std::vec::Vec::new(),
+            },
+        ));
+    }
+    assert_eq!(env.auths(), want);
 }
 
 #[test]
@@ -247,4 +288,159 @@ fn distinct_actions_on_one_resource_are_independent() {
     assert!(f.client().check(&f.resource(), &read, &f.holder));
     assert!(!f.client().check(&f.resource(), &f.action(), &f.holder));
     assert_eq!(f.client().live_ids().len(), 1);
+}
+
+// --- who has to sign -------------------------------------------------------
+//
+// One test per entry point that calls `require_auth`, each asserting the exact
+// authorisation the host recorded: address, contract function and arguments.
+// The state-transition tests above cannot catch a dropped `require_auth`.
+
+#[test]
+fn initialize_requires_the_admin() {
+    let env = Env::default();
+    let contract = env.register(KeygateCore, ());
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+
+    KeygateCoreClient::new(&env, &contract).initialize(&admin);
+
+    assert_signed_by(
+        &env,
+        &contract,
+        Symbol::new(&env, "initialize"),
+        (admin.clone(),).into_val(&env),
+        &[&admin],
+    );
+}
+
+#[test]
+fn issue_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    f.issue();
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "issue"),
+        (f.resource(), f.action(), f.holder.clone(), 3_600_u64).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn revoke_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    f.issue();
+
+    f.client().revoke(&f.resource(), &f.action(), &f.holder);
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "revoke"),
+        (f.resource(), f.action(), f.holder.clone()).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn require_access_requires_the_caller() {
+    let f = Fixture::new(1_000);
+    f.issue();
+
+    f.client()
+        .require_access(&f.holder, &f.resource(), &f.action());
+
+    // Not the admin and not the issuer: the caller vouches for itself.
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "require_access"),
+        (f.holder.clone(), f.resource(), f.action()).into_val(&f.env),
+        &[&f.holder],
+    );
+}
+
+#[test]
+fn propose_admin_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    let successor = Address::generate(&f.env);
+
+    f.client().propose_admin(&successor);
+
+    // Staging a successor is the current admin's call; the nominee does not
+    // consent until `accept_admin`.
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "propose_admin"),
+        (successor.clone(),).into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn accept_admin_requires_the_pending_admin() {
+    let f = Fixture::new(1_000);
+    let successor = Address::generate(&f.env);
+    f.client().propose_admin(&successor);
+
+    f.client().accept_admin();
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "accept_admin"),
+        ().into_val(&f.env),
+        &[&successor],
+    );
+}
+
+#[test]
+fn cancel_admin_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    let successor = Address::generate(&f.env);
+    f.client().propose_admin(&successor);
+
+    f.client().cancel_admin();
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "cancel_admin"),
+        ().into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn pause_requires_the_admin() {
+    let f = Fixture::new(1_000);
+
+    f.client().pause();
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "pause"),
+        ().into_val(&f.env),
+        &[&f.admin],
+    );
+}
+
+#[test]
+fn unpause_requires_the_admin() {
+    let f = Fixture::new(1_000);
+    f.client().pause();
+
+    f.client().unpause();
+
+    assert_signed_by(
+        &f.env,
+        &f.contract,
+        Symbol::new(&f.env, "unpause"),
+        ().into_val(&f.env),
+        &[&f.admin],
+    );
 }
